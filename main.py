@@ -21,17 +21,20 @@ import io
 from logging import Formatter
 import sys
 import datetime
-
+import re
+import time
 import aiohttp
 from PIL import Image
 import ddddocr
-from fake_useragent import UserAgent
 from rich.logging import RichHandler
 from rich.console import Console
+import base64
+from Crypto.Cipher import PKCS1_v1_5 as Cipher_pkcs1_v1_5
+from Crypto.PublicKey import RSA
 
-
-# TODO(you): Replace the following cookie with your own cookie.
-COOKIE = "PHPSESSID=abcdefghijklmnopqrstuvwxyz; vjuid=123456; vjvd=abcdefghijklmnopqrstuvwxyz123456; vt=123456789"
+# TODO(you): Replace the following username and password with your own.
+USERNAME = "yourname23@mails.ucas.ac.cn"
+PASSWORD = "yourpassword"
 # TODO(you): Modify the following targets according to your needs.
 TARGETS = [
     # for west campus
@@ -50,27 +53,45 @@ TARGETS = [
     {"location": "east", "abscissa": "6号场地", "yaxis": ["18:00-19:00", "19:00-20:00"]},
     {"location": "east", "abscissa": "7号场地", "yaxis": ["18:00-19:00", "19:00-20:00"]},
     {"location": "east", "abscissa": "8号场地", "yaxis": ["18:00-19:00", "19:00-20:00"]},
-]
+]  # fmt: skip
 
-
+# The date of booking, which is the day after tomorrow by default.
 date = (datetime.datetime.today() + datetime.timedelta(days=2)).strftime("%Y-%m-%d")
-ua = UserAgent().chrome
-headers = {
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Accept-Language": "zh-CN,zh;q=0.9,zh-TW;q=0.8,en-US;q=0.7,en;q=0.6",
-    "Connection": "keep-alive",
-    "Content-Type": "application/x-www-form-urlencoded",
-    "Cookie": COOKIE,
-    "Host": "ehall.ucas.ac.cn",
-    "Origin": "https://ehall.ucas.ac.cn",
-    "Referer": "https://ehall.ucas.ac.cn/v2/reserve/reserveDetail?id=6",
-    "Sec-Fetch-Dest": "empty",
-    "Sec-Fetch-Mode": "cors",
-    "Sec-Fetch-Site": "same-origin",
-    "User-Agent": ua,
-    "X-Requested-With": "XMLHttpRequest",
-}
+
+
+def encrpt_password(password) -> str:
+    public_key = """-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxG1zt7VW/VNk1KJC7Au
+oInrMZKTf0h6S6xBaROgCz8F3xdEIwdTBGrjUKIhIFCeDr6esfiVxUpdCdiRtqa
+CS9IdXO+9Fs2l6fx6oGkAA9pnxIWL7bw5vAxyK+liu7BToMFhUdiyRdB6erC1g/
+fwDVBywCWhY4wCU2/TSsTBDQhuGZzy+hmZGEB0sqgZbbJpeosW87dNZFomn/uGh
+fCDJzswjS/x0OXD9yyk5TEq3QEvx5pWCcBJqAoBfDDQy5eT3RR5YBGDJODHqW1c
+2OwwdrybEEXKI9RCZmsNyIs2eZn1z1Cw1AdR+owdXqbJf9AnM3e1CN8GcpWLDyO
+naRymLgQIDAQAB
+-----END PUBLIC KEY-----"""
+    rsakey = RSA.importKey(public_key)
+    cipher = Cipher_pkcs1_v1_5.new(rsakey)
+    cipher_text = base64.b64encode(cipher.encrypt(password.encode()))
+    return cipher_text.decode()
+
+
+async def login(session):
+    await session.post(
+        "https://sep.ucas.ac.cn/slogin",
+        data={
+            "userName": USERNAME,
+            "pwd": encrpt_password(PASSWORD),
+            "loginFrom": "",
+            "sb": "sb",
+        },
+    )
+    async with session.get("https://sep.ucas.ac.cn/portal/site/416/2095") as resp:
+        pattern = r'<h4>2秒钟没有响应请点击<a href="(.*?)"><strong>这里</strong></a>直接跳转</h4>'
+        match = re.search(pattern, await resp.text())
+        if match:
+            await session.get(match.group(1))
+        else:
+            logging.error("Login failed, please check your username and password.")
 
 
 async def get_resource_info_margin(session, resource_id) -> dict:
@@ -81,7 +102,10 @@ async def get_resource_info_margin(session, resource_id) -> dict:
     async with session.get(url) as resp:
         json = await resp.json()
         if json["d"] == []:
-            logging.error("Your cookie is invalid, please check it: \n%s", COOKIE)
+            logging.error(
+                "Your cookie is invalid, please check it: \n%s",
+                session.cookie_jar.filter_cookies("https://ehall.ucas.ac.cn"),
+            )
             sys.exit(1)
         return json
 
@@ -142,17 +166,24 @@ async def main():
     console = Console()
     init_logger(console)
 
-    async with aiohttp.ClientSession(headers=headers) as session:
+    async with aiohttp.ClientSession() as session:
+        await login(session)
+
         data_list = await generate_data_list(session)
+        logging.info(
+            "Start booking, your account is: %s\n%s",
+            USERNAME,
+            session.cookie_jar.filter_cookies("https://ehall.ucas.ac.cn"),
+        )
 
-        logging.info("Start booking, your current cookie is: \n%s", COOKIE)
-
-        ocr = ddddocr.DdddOcr(show_ad=False)
+        ocr = ddddocr.DdddOcr()
         with console.status("[bold green]Still booking, please wait..."):
             while True:
                 for i, data in enumerate(data_list):
                     payload = {
-                        "resource_id": "6" if TARGETS[i]["location"] == "west" else "14",
+                        "resource_id": "6"
+                        if TARGETS[i]["location"] == "west"
+                        else "14",
                         "code": await process_captcha(session, ocr),
                         "remarks": "",
                         "deduct_num": "",
@@ -175,10 +206,9 @@ async def main():
                             or message == "预约日期已被禁用"
                             or message == "预约次数限制达到上限"
                         ):
-                            # current_time = time.strftime("%H:%M", time.localtime())
-                            # if current_time >= "12:40" or current_time <= "12:20":
-                            #     return
-                            pass
+                            current_time = time.strftime("%H:%M", time.localtime())
+                            if current_time >= "12:40" or current_time <= "12:20":
+                                return
 
 
 if __name__ == "__main__":
